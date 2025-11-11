@@ -1,0 +1,31 @@
+# -------- Go --------
+/bin/
+/build/
+/dist/
+/out/
+coverage.*
+*.test
+*.exe
+*.dll
+*.so
+*.dylib
+
+# go modules cache (보통 repo에는 올리지 않음)
+**/vendor/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# env / secret
+.env
+.env.*
+*.key
+*.pem
+*.crt
+
+# logs
+*.log
