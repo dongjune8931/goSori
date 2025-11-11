@@ -1,0 +1,20 @@
+server:
+  port: 8080
+  host: 0.0.0.0
+
+webrtc:
+  stun_servers:
+    - stun:stun.l.google.com:19302
+
+ai:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    stt_model: whisper-1
+    translation_model: gpt-4-turbo
+
+pipeline:
+  stt_workers: 10        # ⭐ STT Worker Pool 크기
+  translation_workers: 5  # ⭐ Translation Worker Pool 크기
+  audio_queue_size: 100
+  transcript_queue_size: 100
+  output_queue_size: 100
