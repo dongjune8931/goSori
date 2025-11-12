@@ -8,7 +8,7 @@ webrtc:
 
 ai:
   openai:
-    api_key: ${OPENAI_API_KEY}
+    api_key: ''
     stt_model: whisper-1
     translation_model: gpt-4-turbo
 
@@ -18,3 +18,9 @@ pipeline:
   audio_queue_size: 100
   transcript_queue_size: 100
   output_queue_size: 100
+
+mongodb:
+  uri: mongodb://localhost:27017
+  database: goSori
+  timeout: 10s
+  max_pool_size: 100

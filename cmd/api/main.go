@@ -11,10 +11,14 @@ import (
 	"time"
 
 	"github.com/dongjune8931/goSori/internal/ai"
+	"github.com/dongjune8931/goSori/internal/handlers"
 	"github.com/dongjune8931/goSori/internal/pipeline"
 	"github.com/dongjune8931/goSori/internal/webrtc"
+	wsManager "github.com/dongjune8931/goSori/internal/websocket"
 	"github.com/dongjune8931/goSori/pkg/config"
+	"github.com/dongjune8931/goSori/pkg/database"
 	"github.com/dongjune8931/goSori/pkg/models"
+	"github.com/dongjune8931/goSori/pkg/repository"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
@@ -26,17 +30,6 @@ var (
 		},
 	}
 )
-
-// RoomManager 간단한 룸 관리 (메모리 기반)
-type RoomManager struct {
-	rooms map[string]*Room
-}
-
-// Room WebRTC 룸
-type Room struct {
-	ID      string
-	Clients map[string]*Client
-}
 
 // Client 클라이언트 정보
 type Client struct {
@@ -54,7 +47,26 @@ func main() {
 	}
 	log.Println("✓ Config 로드 완료")
 
-	// 2. AI 클라이언트 생성
+	// 2. MongoDB 연결 (Context 기반, Singleton)
+	mongoDB, err := database.NewMongoDB(cfg)
+	if err != nil {
+		log.Fatalf("MongoDB 연결 실패: %v", err)
+	}
+	defer mongoDB.Close()
+	log.Println("✓ MongoDB 연결 완료")
+
+	// 3. Repository 생성 (Interface 기반)
+	roomRepo := repository.NewMongoRoomRepository(mongoDB.Database)
+	eventRepo := repository.NewMongoEventRepository(mongoDB.Database)
+	log.Println("✓ Repository 생성 완료")
+
+	// 4. EventSaver 생성 및 시작 (Channel 기반 비동기 저장)
+	eventSaver := pipeline.NewEventSaver(eventRepo, 100)
+	eventSaver.Start()
+	defer eventSaver.Stop()
+	log.Println("✓ EventSaver 시작 완료")
+
+	// 5. AI 클라이언트 생성
 	sttClient, err := ai.NewSTTClient(cfg)
 	if err != nil {
 		log.Fatalf("STT 클라이언트 생성 실패: %v", err)
@@ -67,7 +79,7 @@ func main() {
 	}
 	log.Println("✓ Translation 클라이언트 생성 완료")
 
-	// 3. 워커 풀 생성
+	// 6. 워커 풀 생성
 	sttPool := pipeline.NewSTTWorkerPool(
 		cfg.Pipeline.STTWorkers,
 		cfg.Pipeline.AudioQueueSize,
@@ -84,7 +96,15 @@ func main() {
 	)
 	log.Printf("✓ Translation Worker Pool 생성 완료 (%d workers)", cfg.Pipeline.TranslationWorkers)
 
-	// 4. AudioPipeline 생성 및 시작
+	// 7. WebSocket ConnectionManager 생성
+	connManager := wsManager.NewConnectionManager()
+	log.Println("✓ WebSocket Connection Manager 생성 완료")
+
+	// 8. AudioUploadHandler 생성 (AI 테스트용)
+	uploadHandler := handlers.NewAudioUploadHandler(nil) // 나중에 pipeline 설정
+	log.Println("✓ Audio Upload Handler 생성 완료")
+
+	// 9. AudioPipeline 생성 및 시작 (Channel 기반 파이프라인)
 	audioPipeline := pipeline.NewAudioPipeline(
 		sttPool,
 		translationPool,
@@ -93,42 +113,67 @@ func main() {
 			log.Printf("📝 번역 완료: [%s→%s] %s → %s",
 				event.SourceLang, event.TargetLang,
 				event.SourceText, event.TargetText)
-			// TODO: WebSocket으로 클라이언트에 전송
+
+			// MongoDB에 비동기 저장 (Go Channel 활용)
+			eventSaver.SaveTranslation(event)
+
+			// UploadHandler에 결과 저장 (테스트용)
+			uploadHandler.SaveResult(event)
+
+			// WebSocket으로 실시간 브로드캐스트 ✅
+			connManager.BroadcastTranslation(event)
 		},
 	)
 	audioPipeline.Start()
+	defer audioPipeline.Stop()
 	log.Println("✓ Audio Pipeline 시작 완료")
 
-	// 5. AudioHandler 생성
+	// 9. AudioHandler 생성
 	audioHandler := webrtc.NewAudioHandler(audioPipeline)
 	log.Println("✓ Audio Handler 생성 완료")
 
-	// 6. RoomManager 생성
-	roomManager := &RoomManager{
-		rooms: make(map[string]*Room),
-	}
-	log.Println("✓ Room Manager 생성 완료")
-
-	// 7. Gin HTTP 서버 설정
+	// 10. Gin HTTP 서버 설정
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 
+	// UploadHandler에 pipeline 설정
+	uploadHandler = handlers.NewAudioUploadHandler(audioPipeline)
+
 	// Health Check
 	router.GET("/health", func(c *gin.Context) {
+		// Context 기반 MongoDB Ping
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		mongoStatus := "healthy"
+		if err := mongoDB.Ping(ctx); err != nil {
+			mongoStatus = "unhealthy"
+		}
+
 		c.JSON(http.StatusOK, gin.H{
-			"status": "healthy",
-			"time":   time.Now(),
+			"status":  "healthy",
+			"time":    time.Now(),
+			"mongodb": mongoStatus,
 		})
 	})
 
-	// 룸 생성
+	// 룸 생성 (Repository 사용)
 	router.POST("/room", func(c *gin.Context) {
 		roomID := fmt.Sprintf("room-%d", time.Now().Unix())
-		room := &Room{
+
+		// Context with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		// Repository를 통해 MongoDB에 저장
+		room := &repository.Room{
 			ID:      roomID,
-			Clients: make(map[string]*Client),
+			Clients: []string{},
 		}
-		roomManager.rooms[roomID] = room
+		if err := roomRepo.Create(ctx, room); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 
 		log.Printf("✓ 룸 생성: %s", roomID)
 
@@ -136,6 +181,26 @@ func main() {
 			"room_id": roomID,
 		})
 	})
+
+	// 룸 조회
+	router.GET("/room/:roomId", func(c *gin.Context) {
+		roomID := c.Param("roomId")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		room, err := roomRepo.FindByID(ctx, roomID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, room)
+	})
+
+	// 🧪 테스트 엔드포인트: 오디오 파일 업로드 및 AI 처리
+	router.POST("/test/audio", uploadHandler.UploadAudio)
+	router.GET("/test/result/:id", uploadHandler.GetResult)
 
 	// WebSocket Signaling
 	router.GET("/ws/:roomId", func(c *gin.Context) {
@@ -154,30 +219,32 @@ func main() {
 			return
 		}
 
-		// 클라이언트 등록
+		// 클라이언트 등록 (Repository 사용)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := roomRepo.AddClient(ctx, roomID, clientID); err != nil {
+			log.Printf("클라이언트 추가 실패: %v", err)
+			cancel()
+			conn.Close()
+			return
+		}
+		cancel()
+
 		client := &Client{
 			ID:     clientID,
 			RoomID: roomID,
 			Conn:   conn,
 		}
 
-		room, exists := roomManager.rooms[roomID]
-		if !exists {
-			room = &Room{
-				ID:      roomID,
-				Clients: make(map[string]*Client),
-			}
-			roomManager.rooms[roomID] = room
-		}
-		room.Clients[clientID] = client
+		// ConnectionManager에 연결 추가
+		connManager.AddConnection(roomID, clientID, conn)
 
 		log.Printf("✓ 클라이언트 연결: Room=%s, Client=%s", roomID, clientID)
 
-		// WebSocket 메시지 처리
-		go handleWebSocket(client, audioHandler, roomManager)
+		// WebSocket 메시지 처리 (Goroutine)
+		go handleWebSocket(client, audioHandler, roomRepo, connManager)
 	})
 
-	// 8. HTTP 서버 시작
+	// 10. HTTP 서버 시작
 	serverAddr := fmt.Sprintf("%s:%s", cfg.Server.Host, cfg.Server.Port)
 	srv := &http.Server{
 		Addr:    serverAddr,
@@ -191,7 +258,7 @@ func main() {
 		}
 	}()
 
-	// 9. Graceful Shutdown
+	// 11. Graceful Shutdown (Context 기반)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -210,19 +277,34 @@ func main() {
 	audioPipeline.Stop()
 	log.Println("✓ Audio Pipeline 종료 완료")
 
+	// EventSaver 종료
+	eventSaver.Stop()
+	log.Println("✓ EventSaver 종료 완료")
+
+	// MongoDB 연결 종료
+	mongoDB.Close()
+	log.Println("✓ MongoDB 연결 종료 완료")
+
 	log.Println("=== 서버 종료 완료 ===")
 }
 
-// handleWebSocket WebSocket 메시지 처리
-func handleWebSocket(client *Client, audioHandler *webrtc.AudioHandler, roomManager *RoomManager) {
+// handleWebSocket WebSocket 메시지 처리 (Goroutine)
+func handleWebSocket(client *Client, audioHandler *webrtc.AudioHandler, roomRepo repository.RoomRepository, connManager *wsManager.ConnectionManager) {
 	defer func() {
 		client.Conn.Close()
 
-		// 룸에서 클라이언트 제거
-		if room, exists := roomManager.rooms[client.RoomID]; exists {
-			delete(room.Clients, client.ID)
-			log.Printf("✓ 클라이언트 연결 해제: Room=%s, Client=%s", client.RoomID, client.ID)
+		// ConnectionManager에서 연결 제거
+		connManager.RemoveConnection(client.RoomID, client.ID)
+
+		// Repository를 통해 클라이언트 제거
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := roomRepo.RemoveClient(ctx, client.RoomID, client.ID); err != nil {
+			log.Printf("클라이언트 제거 실패: %v", err)
 		}
+
+		log.Printf("✓ 클라이언트 연결 해제: Room=%s, Client=%s", client.RoomID, client.ID)
 	}()
 
 	for {
@@ -247,29 +329,10 @@ func handleWebSocket(client *Client, audioHandler *webrtc.AudioHandler, roomMana
 		switch msgType {
 		case "offer", "answer", "ice-candidate":
 			// WebRTC 시그널링 메시지를 같은 룸의 다른 클라이언트에게 브로드캐스트
-			broadcastToRoom(client, roomManager, msg)
+			connManager.BroadcastToRoom(client.RoomID, msg)
 
 		default:
 			log.Printf("알 수 없는 메시지 타입: %s", msgType)
-		}
-	}
-}
-
-// broadcastToRoom 같은 룸의 다른 클라이언트에게 메시지 브로드캐스트
-func broadcastToRoom(sender *Client, roomManager *RoomManager, msg map[string]interface{}) {
-	room, exists := roomManager.rooms[sender.RoomID]
-	if !exists {
-		return
-	}
-
-	for clientID, client := range room.Clients {
-		if clientID == sender.ID {
-			continue // 보낸 사람 제외
-		}
-
-		err := client.Conn.WriteJSON(msg)
-		if err != nil {
-			log.Printf("메시지 전송 실패: %v", err)
 		}
 	}
 }
