@@ -331,6 +331,31 @@ func handleWebSocket(client *Client, audioHandler *webrtc.AudioHandler, roomRepo
 			// WebRTC 시그널링 메시지를 같은 룸의 다른 클라이언트에게 브로드캐스트
 			connManager.BroadcastToRoom(client.RoomID, msg)
 
+		case "audio":
+			// 실시간 오디오 스트리밍 처리
+			userID, _ := msg["userId"].(string)
+			roomID, _ := msg["roomId"].(string)
+
+			// 오디오 데이터 파싱 (배열 형태로 전송됨)
+			dataArray, ok := msg["data"].([]interface{})
+			if !ok {
+				log.Println("❌ 잘못된 오디오 데이터 형식")
+				continue
+			}
+
+			// []interface{} -> []byte 변환
+			audioData := make([]byte, len(dataArray))
+			for i, v := range dataArray {
+				if num, ok := v.(float64); ok {
+					audioData[i] = byte(num)
+				}
+			}
+
+			// AudioHandler를 통해 파이프라인에 전송
+			if err := audioHandler.ProcessAudioData(audioData, userID, roomID); err != nil {
+				log.Printf("❌ 오디오 처리 실패: %v", err)
+			}
+
 		default:
 			log.Printf("알 수 없는 메시지 타입: %s", msgType)
 		}
