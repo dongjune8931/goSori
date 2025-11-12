@@ -14,6 +14,7 @@ type Config struct {
 	WebRTC   WebRTCConfig   `mapstructure:"webrtc"`
 	AI       AIConfig       `mapstructure:"ai"`
 	Pipeline PipelineConfig `mapstructure:"pipeline"`
+	MongoDB  MongoDBConfig  `mapstructure:"mongodb"`
 }
 
 // ServerConfig 서버 설정
@@ -48,6 +49,14 @@ type PipelineConfig struct {
 	OutputQueueSize     int `mapstructure:"output_queue_size"`
 }
 
+// MongoDBConfig MongoDB 설정
+type MongoDBConfig struct {
+	URI         string `mapstructure:"uri"`
+	Database    string `mapstructure:"database"`
+	Timeout     string `mapstructure:"timeout"`
+	MaxPoolSize int    `mapstructure:"max_pool_size"`
+}
+
 // LoadConfig 설정 파일을 로드하고 환경변수를 병합합니다
 func LoadConfig() (*Config, error) {
 	// 현재 작업 디렉토리 가져오기
@@ -73,6 +82,10 @@ func LoadConfig() (*Config, error) {
 	// 환경변수로부터 특정 값 읽기 (config.yaml의 ${ENV_VAR} 형식 대체)
 	if apiKey := os.Getenv("OPENAI_API_KEY"); apiKey != "" {
 		viper.Set("ai.openai.api_key", apiKey)
+	}
+
+	if mongoURI := os.Getenv("MONGODB_URI"); mongoURI != "" {
+		viper.Set("mongodb.uri", mongoURI)
 	}
 
 	// Config 구조체로 언마샬링
@@ -105,6 +118,14 @@ func validateConfig(cfg *Config) error {
 
 	if cfg.Pipeline.TranslationWorkers <= 0 {
 		return fmt.Errorf("Translation 워커 수는 1 이상이어야 합니다")
+	}
+
+	if cfg.MongoDB.URI == "" {
+		return fmt.Errorf("MongoDB URI가 설정되지 않았습니다")
+	}
+
+	if cfg.MongoDB.Database == "" {
+		return fmt.Errorf("MongoDB Database가 설정되지 않았습니다")
 	}
 
 	return nil
